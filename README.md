@@ -117,6 +117,16 @@ python pipeline.py --analyze-only --max-jobs 50             # analyze only (for 
 | `/api/interview/start` | POST | Start mock interview |
 | `/api/interview/answer` | POST | Submit interview answer |
 
+## Job-Hunt Skill Suite (skills/)
+
+Eight interlocking job-hunt skills that turn this repo into the command system of a real search (market scan → culture vetting → resume tailoring → GitHub polish → application pipeline → interview drills → offer negotiation). The bridge `scripts/sync_to_jobhunt.py` exports AI/Agent roles and the application board from `jobs.db` into a local workspace (default `~/project/AI/job-hunt/`, private, never committed):
+
+```bash
+python3 scripts/sync_to_jobhunt.py   # idempotent: only rewrites the anchored auto-blocks
+```
+
+See [skills/README.md](skills/README.md).
+
 ## Roadmap
 
 Crawl, analyze, resume match, and mock interview work end to end. The next steps widen the funnel and follow the hunt past the match:

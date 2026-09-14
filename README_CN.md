@@ -117,6 +117,16 @@ python pipeline.py --analyze-only --max-jobs 50             # 仅分析（测试
 | `/api/interview/start` | POST | 开始面试 |
 | `/api/interview/answer` | POST | 提交答案 |
 
+## 求职 Skill 套件（skills/）
+
+与本项目配套的 8 个求职 skill（市场扫描 → 风气尽调 → 简历定制 → GitHub 门面 → 投递管道 → 面试特训 → 谈薪，总控每日闭环）。数据桥 `scripts/sync_to_jobhunt.py` 把 `jobs.db` 里筛出的 AI/Agent 岗位和投递看板同步到本地求职工作区（默认 `~/project/AI/job-hunt/`，含隐私数据，不入库）：
+
+```bash
+python3 scripts/sync_to_jobhunt.py   # 幂等：只重写 targets.md / applications.md 的锚点自动区块
+```
+
+详见 [skills/README.md](skills/README.md)。
+
 ## 后续规划
 
 爬取、分析、简历匹配、模拟面试已经能跑通整条链路，接下来想把入口拓宽、把求职跟到匹配之后：
