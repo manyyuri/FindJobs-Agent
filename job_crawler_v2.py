@@ -11,6 +11,7 @@ import random
 import logging
 import argparse
 import hashlib
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from abc import ABC, abstractmethod
@@ -1557,6 +1558,165 @@ def create_feishu_crawler(company_code: str, company_name: str):
     return SpecificFeishuCrawler
 
 
+# ==================== Moka 招聘 (app.mokahr.com) ====================
+# 响应为 AES-128-CBC 密文: key = 每响应 necromancer 字段, IV = 页面全局 aesIv
+# 依赖 pycryptodome (pip install pycryptodome)
+try:
+    from Crypto.Cipher import AES as _AES
+    from Crypto.Util.Padding import unpad as _unpad
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+
+
+class MokaJobsCrawler(JobCrawlerBase):
+    """Moka 招聘 SaaS 通用爬虫（月之暗面/阶跃星辰/智源等）"""
+    AES_IV = b'de7c21ed8d6f50fe'  # window.TurboApply.data.aesIv (全局固定)
+
+    def __init__(self, org: str, site_id, company_name: str, path_mode: str = 'apply', max_jobs: int = MAX_JOBS_PER_COMPANY):
+        super().__init__(max_jobs)
+        self._org = org
+        self._site_id = site_id
+        self._name = company_name
+        self._portal = f"https://app.mokahr.com/{path_mode}/{org}/{site_id}"
+
+    @property
+    def company_name(self) -> str:
+        return self._name
+
+    def _decrypt(self, payload: Dict):
+        import base64 as _b64
+        raw = _b64.b64decode(payload['data'])
+        key = payload['necromancer'].encode('utf-8')[:16]
+        pt = _unpad(_AES.new(key, _AES.MODE_CBC, self.AES_IV).decrypt(raw), 16)
+        return json.loads(pt.decode('utf-8'))
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        text = re.sub(r'<br\s*/?>|</p>|</li>|</div>', '\n', html or '')
+        text = re.sub(r'<[^>]+>', '', text)
+        import html as _html
+        return _html.unescape(text).strip()
+
+    def crawl(self) -> List[Dict]:
+        if not _HAS_CRYPTO:
+            logger.warning(f"⚠️  {self.company_name} 需要 pycryptodome (pip install pycryptodome)")
+            return self.jobs
+        logger.info(f"🚀 {self.company_name}...")
+        self._request(self._portal, method='GET')  # 种 cookie
+        offset = 0
+        while not self._should_stop():
+            resp = self._request(
+                'https://app.mokahr.com/api/outer/ats-apply/website/jobs/v2', method='POST',
+                headers={'Content-Type': 'application/json', 'Origin': 'https://app.mokahr.com', 'Referer': self._portal},
+                json={'keyword': '', 'limit': 10, 'offset': offset, 'projectType': 1,
+                      'orgId': self._org, 'siteId': self._site_id, 'no': 1})
+            if not resp:
+                break
+            try:
+                payload = resp.json()
+                if 'necromancer' not in payload:
+                    break
+                jobs = self._decrypt(payload).get('data', {}).get('jobs', [])
+                if not jobs:
+                    break
+                for job in jobs:
+                    if self._should_stop():
+                        break
+                    locs = job.get('locations') or []
+                    city = '/'.join(dict.fromkeys(
+                        f"{l.get('provinceName', '')}{l.get('cityName', '')}" for l in locs if l))
+                    zhineng = job.get('zhineng') or {}
+                    self.jobs.append(self._normalize_job({
+                        'job_title': job.get('title', ''),
+                        'job_id': f"{self._org}_{job.get('id', '')}",
+                        'category': job.get('commitment', '') + ('/实习' if job.get('showIsCampus') else ''),
+                        'location': city,
+                        'job_type': zhineng.get('name', '') if isinstance(zhineng, dict) else '',
+                        'job_description': self._strip_html(job.get('jobDescription') or ''),
+                        'apply_url': f"{self._portal}#/job/{job.get('id', '')}",
+                    }))
+                offset += 10
+            except Exception:
+                break
+        logger.info(f"  └─ {len(self.jobs)} 个")
+        return self.jobs
+
+
+def create_moka_crawler(org: str, site_id, company_name: str, path_mode: str = 'apply'):
+    class SpecificMokaCrawler(MokaJobsCrawler):
+        def __init__(self, max_jobs=MAX_JOBS_PER_COMPANY):
+            super().__init__(org, site_id, company_name, path_mode, max_jobs)
+    return SpecificMokaCrawler
+
+
+# ==================== 飞书招聘 SaaS 租户版 (随机码域名) ====================
+# 例: MiniMax vrfi1sk8a0.jobs.feishu.cn / 百川 cq6qe6bvfr6.jobs.feishu.cn
+class FeishuTenantCrawler(JobCrawlerBase):
+    """飞书招聘租户版 —— 与字节同款 atsx 系统, Cookie channel=saas-career"""
+
+    def __init__(self, host: str, portal: str, company_name: str, max_jobs: int = MAX_JOBS_PER_COMPANY):
+        super().__init__(max_jobs)
+        self._host = host
+        self._portal = portal
+        self._name = company_name
+
+    @property
+    def company_name(self) -> str:
+        return self._name
+
+    def crawl(self) -> List[Dict]:
+        logger.info(f"🚀 {self.company_name}...")
+        base = f"https://{self._host}"
+        self._request(f"{base}/{self._portal}/", method='GET')
+        self.session.cookies.update({'locale': 'zh-CN', 'channel': 'saas-career', 'platform': 'pc'})
+        offset = 0
+        while not self._should_stop():
+            resp = self._request(f"{base}/api/v1/search/job/posts", method='POST',
+                headers={'Content-Type': 'application/json', 'Referer': f"{base}/{self._portal}/"},
+                cookies={'locale': 'zh-CN', 'channel': 'saas-career', 'platform': 'pc'},
+                json={'keyword': '', 'limit': 20, 'offset': offset, 'job_category_id_list': [],
+                      'tag_id_list': [], 'location_code_list': [], 'subject_id_list': [],
+                      'recruitment_id_list': [], 'portal_type': 2, 'website_referer': f"{base}/{self._portal}/"})
+            if not resp:
+                break
+            try:
+                data = resp.json()
+                posts = data.get('data', {}).get('job_post_list', []) if data.get('code') == 0 else []
+                if not posts:
+                    break
+                for job in posts:
+                    if self._should_stop():
+                        break
+                    city = job.get('city_info') or {}
+                    if not city:
+                        cl = job.get('city_list') or []
+                        city = cl[0] if cl else {}
+                    cat = job.get('job_category') or {}
+                    rt = job.get('recruit_type') or {}
+                    self.jobs.append(self._normalize_job({
+                        'job_title': job.get('title', ''),
+                        'job_id': f"{self._host.split('.')[0]}_{job.get('id', '')}",
+                        'category': rt.get('name', '') if isinstance(rt, dict) else '',
+                        'location': city.get('name', '') if isinstance(city, dict) else str(city),
+                        'job_type': cat.get('name', '') if isinstance(cat, dict) else '',
+                        'job_description': f"{job.get('description', '')}\n【要求】{job.get('requirement', '')}",
+                        'apply_url': f"{base}/{self._portal}/position/detail/{job.get('id', '')}",
+                    }))
+                offset += 20
+            except Exception:
+                break
+        logger.info(f"  └─ {len(self.jobs)} 个")
+        return self.jobs
+
+
+def create_feishu_tenant_crawler(host: str, portal: str, company_name: str):
+    class SpecificTenantCrawler(FeishuTenantCrawler):
+        def __init__(self, max_jobs=MAX_JOBS_PER_COMPANY):
+            super().__init__(host, portal, company_name, max_jobs)
+    return SpecificTenantCrawler
+
+
 # ==================== 爬虫注册表 ====================
 
 CRAWLERS = {
@@ -1592,6 +1752,13 @@ CRAWLERS = {
     'ke': create_feishu_crawler('ke', '贝壳找房'),
     'yuanfudao': create_feishu_crawler('yuanfudao', '猿辅导'),
     'zuoyebang': create_feishu_crawler('zuoyebang', '作业帮'),
+    # AI 独角兽 - Moka 招聘 (2026-09 验证)
+    'moonshot': create_moka_crawler('moonshot', 148506, '月之暗面'),
+    'stepfun': create_moka_crawler('step', 94904, '阶跃星辰', 'social-recruitment'),
+    'baai': create_moka_crawler('baai', 42174, '智源研究院', 'campus-recruitment'),
+    # AI 独角兽 - 飞书招聘 SaaS 租户版 (2026-09 验证)
+    'minimax': create_feishu_tenant_crawler('vrfi1sk8a0.jobs.feishu.cn', '379481', 'MiniMax'),
+    'baichuan': create_feishu_tenant_crawler('cq6qe6bvfr6.jobs.feishu.cn', 'baichuanzhaopin', '百川智能'),
     # 招聘平台
     'zhilian': ZhilianCrawler,
     'lagou': LagouCrawler,
