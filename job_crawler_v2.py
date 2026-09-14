@@ -423,20 +423,27 @@ class BaiduCrawler(JobCrawlerBase):
     
     def crawl(self) -> List[Dict]:
         logger.info(f"🚀 {self.company_name}...")
-        for recruit_type in ['SOCIAL', 'CAMPUS']:
+        # 2026-09 实测：/httservice/getPostListNew 已下线（非法访问），
+        # 新端点 = POST /httservice/getPostList，且必须 form-encoded（JSON 会报 Illegal argument）
+        url = "https://talent.baidu.com/httservice/getPostList"
+        for recruit_type, label in [('SOCIAL', '社招'), ('GRADUATE', '校招')]:
             if self._should_stop():
                 break
             page = 1
             while not self._should_stop():
-                url = "https://talent.baidu.com/httservice/getPostListNew"
-                payload = {"recruitType": recruit_type, "pageSize": 50, "curPage": page}
-                headers = {**DEFAULT_HEADERS, 'Content-Type': 'application/json'}
-                resp = self._request(url, method='POST', json=payload, headers=headers)
+                payload = {
+                    'recruitType': recruit_type, 'pageSize': 20, 'curPage': page,
+                    'workPlace': '', 'postType': '', 'keyWord': '', 'projectType': '',
+                }
+                resp = self._request(url, method='POST', data=payload,
+                                     headers={**DEFAULT_HEADERS, 'Origin': 'https://talent.baidu.com', 'Referer': 'https://talent.baidu.com/jobs/social-list'})
                 if not resp:
                     break
                 try:
                     data = resp.json()
-                    posts = data.get('data', {}).get('list', [])
+                    if data.get('status') != 'ok':
+                        break
+                    posts = (data.get('data') or {}).get('list', [])
                     if not posts:
                         break
                     for post in posts:
@@ -445,17 +452,19 @@ class BaiduCrawler(JobCrawlerBase):
                         self.jobs.append(self._normalize_job({
                             'job_title': post.get('name', ''),
                             'job_id': f"BD_{post.get('postId', '')}",
-                            'category': '校招' if recruit_type == 'CAMPUS' else '社招',
+                            'category': label,
                             'location': post.get('workPlace', ''),
-                            'job_type': post.get('serviceType', ''),
-                            'job_description': post.get('serviceCondition', ''),
-                            'job_requirements': post.get('workContent', ''),
+                            'job_type': post.get('postType', ''),
+                            'special_program': post.get('orgName', ''),
+                            'job_description': post.get('workContent', ''),
+                            'job_requirements': post.get('serviceCondition', ''),
                             'apply_url': f"https://talent.baidu.com/jobs/detail/{post.get('postId', '')}",
                         }))
-                    if page * 50 >= data.get('data', {}).get('total', 0):
+                    total = int((data.get('data') or {}).get('total') or 0)
+                    if page * 20 >= total:
                         break
                     page += 1
-                except:
+                except Exception:
                     break
         logger.info(f"  └─ {len(self.jobs)} 个")
         return self.jobs
@@ -1329,60 +1338,59 @@ class ByteDanceAPICrawler(JobCrawlerBase):
         return "字节跳动"
     
     def crawl(self) -> List[Dict]:
-        logger.info(f"🚀 {self.company_name} (尝试API)...")
-        # 尝试字节的API
+        logger.info(f"🚀 {self.company_name}...")
+        # 2026-09 实测：jobs.bytedance.com 已迁到飞书 atsx 招聘系统，
+        # 旧 GET /api/v1/search/job/posts 会被路由到猎头平台(返回HTML)。
+        # 正确姿势 = POST + Cookie: channel=office（官网通道标识）
+        url = "https://jobs.bytedance.com/api/v1/search/job/posts"
+        headers = {
+            'Content-Type': 'application/json',
+            'Referer': 'https://jobs.bytedance.com/experienced/position',
+        }
+        cookies = {'locale': 'zh-CN', 'channel': 'office', 'platform': 'pc'}
         offset = 0
         while not self._should_stop():
-            url = "https://jobs.bytedance.com/api/v1/search/job/posts"
-            params = {'offset': offset, 'limit': 50, 'keyword': ''}
-            resp = self._request(url, params=params)
+            payload = {
+                'keyword': '', 'limit': 50, 'offset': offset,
+                'job_category_id_list': [], 'tag_id_list': [],
+                'location_code_list': [], 'subject_id_list': [],
+                'recruitment_id_list': [], 'portal_type': 2,
+                'website_referer': 'https://jobs.bytedance.com/experienced',
+            }
+            resp = self._request(url, method='POST', json=payload,
+                                 headers=headers, cookies=cookies)
             if not resp:
-                # API失败，从文件加载
-                return self._load_from_file()
+                break
             try:
                 data = resp.json()
-                jobs = data.get('data', {}).get('job_post_list', [])
-                if not jobs:
-                    if not self.jobs:
-                        return self._load_from_file()
+                if data.get('code') != 0:
+                    logger.warning(f"  └─ API code={data.get('code')} {str(data.get('message'))[:50]}")
                     break
-                for job in jobs:
+                posts = data.get('data', {}).get('job_post_list', [])
+                if not posts:
+                    break
+                for job in posts:
                     if self._should_stop():
                         break
+                    city = job.get('city_info', {}).get('name', '')
+                    if not city:
+                        cities = job.get('city_list') or []
+                        city = ','.join(c.get('name', '') for c in cities if c.get('name'))
                     self.jobs.append(self._normalize_job({
                         'job_title': job.get('title', ''),
                         'job_id': job.get('id', ''),
                         'category': job.get('recruit_type', {}).get('name', ''),
-                        'location': job.get('city', {}).get('name', ''),
+                        'location': city,
                         'job_type': job.get('job_category', {}).get('name', ''),
                         'job_description': job.get('description', ''),
                         'job_requirements': job.get('requirement', ''),
-                        'apply_url': f"https://jobs.bytedance.com/position/{job.get('id', '')}",
+                        'apply_url': f"https://jobs.bytedance.com/experienced/position/detail/{job.get('id', '')}",
                     }))
                 offset += 50
-            except:
-                if not self.jobs:
-                    return self._load_from_file()
+            except Exception:
                 break
         logger.info(f"  └─ {len(self.jobs)} 个")
         return self.jobs
-    
-    def _load_from_file(self) -> List[Dict]:
-        """从文件加载"""
-        for fname in ['bytedance_jobs.json', 'bytedance_jobs copy.json']:
-            fpath = ROOT_DIR / fname
-            if fpath.exists():
-                try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    for item in data[:self.max_jobs]:
-                        self.jobs.append(self._normalize_job(item))
-                    logger.info(f"  └─ {len(self.jobs)} 个 (从文件)")
-                    return self.jobs
-                except:
-                    pass
-        logger.warning("  └─ 0 个")
-        return []
 
 
 # ==================== 招聘平台 ====================
